@@ -7,7 +7,7 @@
 #include <time.h>
 #include <ctype.h>
 
-#define PORT 8080
+#define PORT 9999
 
 PGconn *conn;
 
@@ -23,7 +23,7 @@ struct post_status {
 };
 
 struct request_transacao {
-  int valor;
+  char *valor;
   char tipo;
   char *descricao;
 };
@@ -147,42 +147,57 @@ int get_cliente(struct cliente *c, char *id) {
 }
 
 void monta_request_transacao(struct request_transacao *rt, const char *data) {
-  char *token = strtok((char *)data, "\n");
+  char *data_copy = (char *)data;
+
+  while (*data_copy != '{')
+    data_copy++;
+  data_copy++;
+
+  char *token = strtok((char *)data_copy, "\n");
   char *trimmed_data = (char *)malloc(1024);
   while (token) {
     char *trimmed_token = (char *)malloc(strlen(token) + 1);
     int i = 0;
-    while (isspace(token[i])) {
+    while (isspace(token[i]) || isblank(token[i])) {
       i++;
     }
     strcpy(trimmed_token, token + i);
 
     char *end = trimmed_token + strlen(trimmed_token) - 1;
-    while (end > trimmed_token && isspace(*end)) {
+    while (end > trimmed_token && isspace(*end) || isblank(*end)) {
       end--;
     }
     end[1] = '\0';
 
     strcat(trimmed_data, trimmed_token);
     token = strtok(NULL, "\n");
+
   }
   trimmed_data[strlen(trimmed_data) - 1] = '\0'; 
-  trimmed_data++;
   char *trimmed_data_saveptr = NULL;
   char *key_value_saveptr = NULL;
 
   token = strtok_r(trimmed_data, ",", &trimmed_data_saveptr);
   while (token) {
     char *key = strtok_r(token, ":", &key_value_saveptr);
+    while (*key != '"')
+      key++;
     char *value = strtok_r(NULL, ":", &key_value_saveptr);
-    if (strcmp(key, "\"valor\"") == 0) {
-      rt -> valor = atoi(value);
-    } else if (strcmp(key, "\"tipo\"") == 0) {
+
+    char *key_saveptr = NULL;
+    char *key_token = strtok_r(key, "\"", &key_saveptr);
+    while (!key_token) {
+      token = strtok_r(NULL, ",", &key_saveptr);
+    }
+
+    if (strcmp(key_token, "valor") == 0) {
+      rt -> valor = value;
+    } else if (strcmp(key_token, "tipo") == 0) {
       char *tipo_saveptr = NULL;
       char *token_tipo = strtok_r(value, "\"", &tipo_saveptr);
       token_tipo = strtok_r(NULL, "\"", &tipo_saveptr);
       rt -> tipo = token_tipo[0];
-    } else if (strcmp(key, "\"descricao\"") == 0) {
+    } else if (strcmp(key_token, "descricao") == 0) {
       char *descricao_saveptr = NULL;
       char *token_descricao = strtok_r(value, "\"", &descricao_saveptr);
       token_descricao = strtok_r(NULL, "\"", &descricao_saveptr);
@@ -190,6 +205,22 @@ void monta_request_transacao(struct request_transacao *rt, const char *data) {
     }
     token = strtok_r(NULL, ",", &trimmed_data_saveptr);
   }
+}
+
+int valida_request_transacao(struct request_transacao *rt) {
+  if (strlen(rt -> valor) == 0 || strchr(rt -> valor, '.') > 0) {
+    return 0;
+  }
+
+  if (rt -> tipo != 'c' && rt -> tipo != 'd') {
+    return 0;
+  }
+
+  if (rt -> descricao == NULL || strlen(rt->descricao) == 0 || strlen(rt->descricao) > 10){
+    return 0;
+  }
+
+  return 1;
 }
 
 enum MHD_Result handle_request(void *cls, struct MHD_Connection *connection, const char *url, const char *method, const char *version, const char *upload_data, size_t *upload_data_size, void **con_cls) {
@@ -217,7 +248,10 @@ enum MHD_Result handle_request(void *cls, struct MHD_Connection *connection, con
         printf("%s %s\n", method, url);
         struct request_transacao *rt = (struct request_transacao *)malloc(sizeof(struct request_transacao));
         monta_request_transacao(rt, post -> data);
-        printf("Valor: %d\nTipo: %c\nDescricao: %s\n", rt->valor, rt->tipo, rt->descricao);
+        if (!valida_request_transacao(rt)) {
+          return send_response(connection, "{\"error\": \"Unprocessable Entity\"}", 422);
+        }
+        printf("Valor: %s\nTipo: %c\nDescricao: %s\n", rt->valor, rt->tipo, rt->descricao);
         post -> status = 0;
         free(post->data);
         free(post);
