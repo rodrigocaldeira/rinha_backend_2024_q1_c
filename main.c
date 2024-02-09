@@ -6,10 +6,43 @@
 #include <regex.h>
 #include <time.h>
 #include <ctype.h>
+#include <pthread.h>
 
 #define PORT 9999
+#define POOL 10
 
-PGconn *conn;
+PGconn *conn[POOL];
+
+int conn_index = 0;
+pthread_mutex_t mutex;
+
+void create_pool() {
+  for (int i = 0; i < POOL; i++) {
+    conn[i] = PQconnectdb("host=localhost dbname=rinha_backend_2024_q1_dev user=postgres password=postgres");
+  }
+}
+
+PGconn *get_connection() {
+  pthread_mutex_lock(&mutex);
+  if (conn_index == POOL) {
+    conn_index = 0;
+  }
+  if (PQstatus(conn[conn_index]) == CONNECTION_BAD) {
+    printf("Reconnecting to the database\n");
+    PQreset(conn[conn_index]);
+  }
+  PGconn *pg_conn = conn[conn_index];
+  conn_index++;
+  pthread_mutex_unlock(&mutex);
+  return pg_conn;
+}
+
+void close_pool() {
+  for (int i = 0; i < POOL; i++) {
+    PQfinish(conn[i]);
+  }
+}
+
 
 struct transacao {
   char valor[11];
@@ -31,6 +64,7 @@ struct post_status {
 };
 
 int send_response(struct MHD_Connection *connection, const char *response, int http_code) {
+  printf("%s\n", response);
   struct MHD_Response *mhd_response = MHD_create_response_from_buffer(strlen(response), (void *)response, MHD_RESPMEM_PERSISTENT);
   MHD_add_response_header(mhd_response, "Content-Type", "application/json");
   MHD_add_response_header(mhd_response, "Connection", "keep-alive");
@@ -180,12 +214,10 @@ int get_cliente(struct cliente *c, char *id) {
   char query[70];
   sprintf(query, "select saldo, limite, ultimas_transacoes from clientes where id = %s", id);
 
-  if (PQstatus(conn) == CONNECTION_BAD) {
-    return -1;
-  }
-
-  PGresult *res = PQexec(conn, query);
+  PGconn *pg_conn = get_connection();
+  PGresult *res = PQexec(pg_conn, query);
   if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+    printf("Failed to execute the query: %s\n", PQerrorMessage(pg_conn));
     PQclear(res);
     return -2;
   }
@@ -251,13 +283,8 @@ int salva_cliente(struct cliente *c, struct transacao *t) {
   serializar_transacoes(ultimas_transacoes, c -> ultimas_transacoes);
   sprintf(query, "update clientes set saldo = %d, ultimas_transacoes = '%s' where id = %s", c->saldo, ultimas_transacoes, c->id);
 
-  if (PQstatus(conn) == CONNECTION_BAD) {
-    return 0;
-  }
-
-  PGresult *res = PQexec(conn, query);
+  PGresult *res = PQexec(get_connection(), query);
   if (PQresultStatus(res) != PGRES_COMMAND_OK) {
-    printf("Error: %s\n", PQerrorMessage(conn));
     PQclear(res);
     return 0;
   }
@@ -409,10 +436,19 @@ enum MHD_Result handle_request(void *cls, struct MHD_Connection *connection, con
           return send_response(connection, "{\"error\": \"Invalid URL\"}", 400);
         }
 
-        printf("%s\n", post -> data);
+        char *data = (char *)malloc(strlen(post -> data) + 1);
+        strcpy(data, post -> data);
+        char *ptr_data = data;
+        while (*data != '{')
+          data++;
+
+        printf("%s\n", data);
 
         struct transacao *t = (struct transacao *)malloc(sizeof(struct transacao));
-        parse_transacao(t, post -> data);
+        parse_transacao(t, data);
+        
+        free(ptr_data);
+
         if (!valida_transacao(t)) {
           return send_response(connection, "{\"error\": \"Unprocessable Entity\"}", 422);
         }
@@ -534,10 +570,17 @@ int main() {
       MHD_OPTION_END);
 
   if (daemon) {
-    conn = PQconnectdb("host=localhost dbname=rinha_backend_2024_q1_dev user=postgres password=postgres");
+    if (pthread_mutex_init(&mutex, NULL) != 0) {
+      printf("Failed to initialize the mutex\n");
+      return 1;
+    }
+
+    create_pool();
     printf("Server running on port %d\n", PORT);
     getchar();
-    PQfinish(conn);
+    close_pool();
+    pthread_mutex_destroy(&mutex);
+
     MHD_stop_daemon(daemon);
   } else {
     printf("Failed to start the server\n");
