@@ -7,29 +7,40 @@
 #include <time.h>
 #include <ctype.h>
 #include <pthread.h>
+#include <signal.h>
 
-#define PORT 9999
-#define POOL 10
-
-PGconn *conn[POOL];
-
+int port;
+int pool_size;
+PGconn **conn;
 int conn_index = 0;
 pthread_mutex_t mutex;
+struct MHD_Daemon *main_daemon;
+char *connection_string;
 
 void create_pool() {
-  for (int i = 0; i < POOL; i++) {
-    conn[i] = PQconnectdb("host=localhost dbname=rinha_backend_2024_q1_dev user=postgres password=postgres");
+  printf("Creating the connection pool of size %d\n", pool_size);
+  for (int i = 0; i < pool_size; i++) {
+    conn[i] = PQconnectdb("postgres://postgres:postgres@localhost/rinha_backend_2024_q1_dev");
+    while (PQstatus(conn[i]) != CONNECTION_OK) {
+      printf("Failed to connect to the database: %s\n", PQerrorMessage(conn[i]));
+      sleep(1);
+      PQreset(conn[i]);
+    }
   }
 }
 
 PGconn *get_connection() {
   pthread_mutex_lock(&mutex);
-  if (conn_index == POOL) {
+  if (conn_index == pool_size) {
     conn_index = 0;
   }
-  if (PQstatus(conn[conn_index]) == CONNECTION_BAD) {
-    printf("Reconnecting to the database\n");
+  while (PQstatus(conn[conn_index]) == CONNECTION_BAD) {
+    printf("Connection %d is bad, resetting it\n", conn_index);
     PQreset(conn[conn_index]);
+    conn_index++;
+    if (conn_index == pool_size) {
+      conn_index = 0;
+    }
   }
   PGconn *pg_conn = conn[conn_index];
   conn_index++;
@@ -38,24 +49,25 @@ PGconn *get_connection() {
 }
 
 void close_pool() {
-  for (int i = 0; i < POOL; i++) {
+  printf("Closing the connection pool\n");
+  for (int i = 0; i < pool_size; i++) {
     PQfinish(conn[i]);
   }
 }
-
 
 struct transacao {
   char valor[11];
   char tipo;
   char descricao[11];
   char realizada_em[28];
+  int em_uso;
 };
 
 struct cliente {
   char id[2];
   int saldo;
   int limite;
-  struct transacao *ultimas_transacoes[11];
+  struct transacao ultimas_transacoes[10];
 };
 
 struct post_status {
@@ -82,7 +94,7 @@ void now(char *dt) {
   sprintf(dt, "%d-%02d-%02dT%02d:%02d:%02d.%06dZ", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec, (int)tv.tv_usec);
 }
 
-void monta_ultimas_transacoes(struct transacao *transacoes_array[11], char *ultimas_transacoes) {
+void monta_ultimas_transacoes(struct transacao transacoes_array[11], char *ultimas_transacoes) {
   char transacoes[2000];
   char *token = ultimas_transacoes;
 
@@ -122,8 +134,6 @@ void monta_ultimas_transacoes(struct transacao *transacoes_array[11], char *ulti
     return;
   }
 
-  struct transacao *t = (struct transacao *)malloc(sizeof(struct transacao));
-
   char *token_saveptr = NULL;
   char *token2 = strtok_r(transacoes, "[},{]", &token_saveptr);
   char *key_value_saveptr = NULL;
@@ -147,16 +157,16 @@ void monta_ultimas_transacoes(struct transacao *transacoes_array[11], char *ulti
     }
 
     if (strcmp(key_token, "valor") == 0) {
-      strcpy(t -> valor, value);
+      strcpy(transacoes_array[i].valor, value);
       valores++;
     } else if (strcmp(key_token, "tipo") == 0) {
-      t -> tipo = value[2];
+      transacoes_array[i].tipo = value[2];
       valores++;
     } else if (strcmp(key_token, "descricao") == 0) {
       char *descricao_saveptr = NULL;
       char *token_descricao = strtok_r(value, "\"", &descricao_saveptr);
       token_descricao = strtok_r(NULL, "\"", &descricao_saveptr);
-      strcpy(t -> descricao, token_descricao);
+      strcpy(transacoes_array[i].descricao, token_descricao);
       valores++;
     } else if (strcmp(key_token, "realizada_em") == 0) {
       char *token_realizada_em_2 = strtok_r(NULL, ":" , &key_value_saveptr);
@@ -169,22 +179,17 @@ void monta_ultimas_transacoes(struct transacao *transacoes_array[11], char *ulti
       token_realizada_em = strtok_r(NULL, "\"", &realizada_em_saveptr);
       sprintf(realizada_em, "%s:%s:%s", token_realizada_em, token_realizada_em_2, token_realizada_em_3);
       realizada_em[strlen(realizada_em) - 1] = '\0';
-      strcpy(t -> realizada_em, realizada_em);
+      strcpy(transacoes_array[i].realizada_em, realizada_em);
       valores++;
     }
 
     if (valores == 4) {
-      transacoes_array[i] = t;
-      t = (struct transacao *)malloc(sizeof(struct transacao));
+      transacoes_array[i].em_uso = 1;
       valores = 0;
       i++;
     }
 
     token2 = strtok_r(NULL, "[},{]", &token_saveptr);
-  }
-
-  if (i > 0) {
-    transacoes_array[i] = NULL;
   }
 }
 
@@ -237,8 +242,8 @@ int get_cliente(struct cliente *c, char *id) {
   return 0;
 }
 
-void serializar_transacoes(char *transacoes, struct transacao **ultimas_transacoes) {
-  if (ultimas_transacoes == NULL) {
+void serializar_transacoes(char *transacoes, struct cliente *c) {
+  if (!c -> ultimas_transacoes[0].em_uso) {
     transacoes[0] = '{';
     transacoes[1] = '}';
     transacoes[2] = '\0';
@@ -248,9 +253,15 @@ void serializar_transacoes(char *transacoes, struct transacao **ultimas_transaco
   transacoes[0] = '{';
   transacoes[1] = '\0';
   int i = 0;
-  while (ultimas_transacoes[i] != NULL) {
+  while (c -> ultimas_transacoes[i].em_uso) {
     char transacao[200];
-    sprintf(transacao, "\"{\\\"valor\\\":%s,\\\"tipo\\\":\\\"%c\\\",\\\"descricao\\\":\\\"%s\\\",\\\"realizada_em\\\":\\\"%s\\\"}\",", ultimas_transacoes[i]->valor, ultimas_transacoes[i]->tipo, ultimas_transacoes[i]->descricao, ultimas_transacoes[i]->realizada_em);
+    sprintf(transacao, 
+        "\"{\\\"valor\\\":%s,\\\"tipo\\\":\\\"%c\\\",\\\"descricao\\\":\\\"%s\\\",\\\"realizada_em\\\":\\\"%s\\\"}\",", 
+        c -> ultimas_transacoes[i].valor, 
+        c -> ultimas_transacoes[i].tipo, 
+        c -> ultimas_transacoes[i].descricao, 
+        c -> ultimas_transacoes[i].realizada_em);
+
     strcat(transacoes, transacao);
     i++;
   }
@@ -259,17 +270,17 @@ void serializar_transacoes(char *transacoes, struct transacao **ultimas_transaco
   transacoes[strlen(transacoes)] = '\0';
 }
 
-int salva_cliente(struct cliente *c, struct transacao *t) {
+int salva_cliente(struct cliente *c, struct transacao t) {
   char query[2000];
-  if (c -> ultimas_transacoes[0] == NULL) {
+  if (!c -> ultimas_transacoes[0].em_uso) {
     c -> ultimas_transacoes[0] = t;
-    c -> ultimas_transacoes[1] = NULL;
+    c -> ultimas_transacoes[0].em_uso = 1;
   } else {
     int i = 0;
-    while (c -> ultimas_transacoes[i] != NULL && i < 9) {
+    while (c -> ultimas_transacoes[i].em_uso && i < 9) {
       i++;
     }
-    c -> ultimas_transacoes[i + 1] = NULL;
+    c -> ultimas_transacoes[i + 1].em_uso = 0;
 
     while (i >= 1) {
       c -> ultimas_transacoes[i] = c -> ultimas_transacoes[i - 1];
@@ -280,16 +291,22 @@ int salva_cliente(struct cliente *c, struct transacao *t) {
   }
 
   char ultimas_transacoes[2000];
-  serializar_transacoes(ultimas_transacoes, c -> ultimas_transacoes);
+  serializar_transacoes(ultimas_transacoes, c);
   sprintf(query, "update clientes set saldo = %d, ultimas_transacoes = '%s' where id = %s", c->saldo, ultimas_transacoes, c->id);
 
-  PGresult *res = PQexec(get_connection(), query);
+  PGconn *pg_conn = get_connection();
+
+  PQexec(pg_conn, "BEGIN");
+  PGresult *res = PQexec(pg_conn, query);
   if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+    printf("Failed to execute the query: %s\n", PQerrorMessage(pg_conn));
     PQclear(res);
+    PQexec(pg_conn, "ROLLBACK");
     return 0;
   }
 
   PQclear(res);
+  PQexec(pg_conn, "COMMIT");
   return 1;
 }
 
@@ -303,6 +320,7 @@ void parse_transacao(struct transacao *t, const char *data) {
   char *token_saveptr = NULL;
   char *token = strtok_r((char *)data_copy, "\n", &token_saveptr);
   char trimmed_data[1024];
+
   while (token) {
     char *trimmed_token = (char *)malloc(strlen(token) + 1);
     int i = 0;
@@ -320,8 +338,8 @@ void parse_transacao(struct transacao *t, const char *data) {
     strcat(trimmed_data, trimmed_token);
     free(trimmed_token);
     token = strtok_r(NULL, "\n",&token_saveptr);
-
   }
+
   trimmed_data[strlen(trimmed_data) - 1] = '\0'; 
   char *trimmed_data_saveptr = NULL;
   char *key_value_saveptr = NULL;
@@ -359,36 +377,24 @@ void parse_transacao(struct transacao *t, const char *data) {
   now(t -> realizada_em);
 }
 
-int valida_transacao(struct transacao *t) {
-  if (strlen(t -> valor) == 0 || strchr(t -> valor, '.') > 0) {
+int valida_transacao(struct transacao t) {
+  if (strlen(t.valor) == 0 || strchr(t.valor, '.') > 0) {
     return 0;
   }
 
-  if (t -> tipo != 'c' && t -> tipo != 'd') {
+  if (t.tipo != 'c' && t.tipo != 'd') {
     return 0;
   }
 
-  if (strlen(t->descricao) == 0 || strlen(t->descricao) > 10){
+  if (strlen(t.descricao) == 0 || strlen(t.descricao) > 10){
     return 0;
   }
 
   return 1;
 }
 
-void free_cliente(struct cliente *c) {
-  int i = 0;
-  while (c -> ultimas_transacoes[i]) {
-    i++;
-  }
-  while (i > 0) {
-    free(c -> ultimas_transacoes[i - 1]);
-    i--;
-  }
-  free(c);
-}
-
-void serializa_ultimas_transacoes(char *transacoes, struct transacao **ultimas_transacoes) {
-  if (ultimas_transacoes[0] == NULL) {
+void serializa_ultimas_transacoes(char *transacoes, struct cliente *c) {
+  if (!c -> ultimas_transacoes[0].em_uso) {
     transacoes[0] = '[';
     transacoes[1] = ']';
     transacoes[2] = '\0';
@@ -398,9 +404,16 @@ void serializa_ultimas_transacoes(char *transacoes, struct transacao **ultimas_t
   transacoes[0] = '[';
   transacoes[1] = '\0';
   int i = 0;
-  while (ultimas_transacoes[i] != NULL) {
+  while (c -> ultimas_transacoes[i].em_uso) {
     char transacao[300];
-    sprintf(transacao, "{\"valor\":%s,\"tipo\":\"%c\",\"descricao\":\"%s\",\"realizada_em\":\"%s\"},", ultimas_transacoes[i]->valor, ultimas_transacoes[i]->tipo, ultimas_transacoes[i]->descricao, ultimas_transacoes[i]->realizada_em);
+    
+    sprintf(transacao, 
+        "{\"valor\":%s,\"tipo\":\"%c\",\"descricao\":\"%s\",\"realizada_em\":\"%s\"},", 
+        c -> ultimas_transacoes[i].valor, 
+        c -> ultimas_transacoes[i].tipo, 
+        c -> ultimas_transacoes[i].descricao, 
+        c -> ultimas_transacoes[i].realizada_em);
+
     strcat(transacoes, transacao);
     i++;
   }
@@ -444,8 +457,8 @@ enum MHD_Result handle_request(void *cls, struct MHD_Connection *connection, con
 
         printf("%s\n", data);
 
-        struct transacao *t = (struct transacao *)malloc(sizeof(struct transacao));
-        parse_transacao(t, data);
+        struct transacao t;
+        parse_transacao(&t, data);
         
         free(ptr_data);
 
@@ -456,35 +469,34 @@ enum MHD_Result handle_request(void *cls, struct MHD_Connection *connection, con
         free(post);
 
         struct cliente *c = (struct cliente *)malloc(sizeof(struct cliente));
-        c -> ultimas_transacoes[0] = NULL;
 
         switch (get_cliente(c, id)) {
           case 0: 
             {
               int novo_saldo = c->saldo;
 
-              if (t->tipo == 'c') {
-                novo_saldo += atoi(t->valor);
+              if (t.tipo == 'c') {
+                novo_saldo += atoi(t.valor);
               } else {
-                novo_saldo -= atoi(t->valor);
+                novo_saldo -= atoi(t.valor);
               }
 
               if (novo_saldo < -c->limite) {
-                free_cliente(c);
+                free(c);
                 return send_response(connection, "{\"error\": \"Insufficient funds\"}", 422);
               }
 
               c -> saldo = novo_saldo;
 
               if (!salva_cliente(c, t)) {
-                free_cliente(c);
+                free(c);
                 return send_response(connection, "{\"error\": \"Failed to save the client\"}", 500);
               }
 
               char response[2000];
               sprintf(response, "{\"limite\": %d,\"saldo\": %d}", c->limite, c->saldo);
               enum MHD_Result result = send_response(connection, response, 200);
-              free_cliente(c);
+              free(c);
               return result;
             }
           case -1:
@@ -519,7 +531,6 @@ enum MHD_Result handle_request(void *cls, struct MHD_Connection *connection, con
     }
 
     struct cliente *c = (struct cliente *)malloc(sizeof(struct cliente));
-    c -> ultimas_transacoes[0] = NULL;
 
     switch (get_cliente(c, id)) {
       case 0: 
@@ -530,13 +541,13 @@ enum MHD_Result handle_request(void *cls, struct MHD_Connection *connection, con
         char response[2000];
 
         char transacoes[2000];
-        serializa_ultimas_transacoes(transacoes, c -> ultimas_transacoes);
+        serializa_ultimas_transacoes(transacoes, c);
 
         sprintf(response, "{\"saldo\":{\"total\":%d,\"limite\":%d,\"data_extrato\":\"%s\"},\"ultimas_transacoes\":%s}", c->saldo, c->limite, data_extrato, transacoes);
 
         enum MHD_Result result = send_response(connection, response, 200);
 
-        free_cliente(c);
+        free(c);
 
         return result;
       }
@@ -559,33 +570,75 @@ enum MHD_Result handle_request(void *cls, struct MHD_Connection *connection, con
   return send_response(connection, "{\"error\": \"Invalid Request\"}", 400);
 }
 
-int main() {
-  struct MHD_Daemon *daemon = MHD_start_daemon(
-      MHD_USE_SELECT_INTERNALLY | MHD_SUPPRESS_DATE_NO_CLOCK | MHD_USE_EPOLL_LINUX_ONLY | MHD_USE_EPOLL_TURBO,
-      PORT, NULL, NULL, 
-      &handle_request, 
-      NULL, 
-      MHD_OPTION_CONNECTION_TIMEOUT, 120,
-      MHD_OPTION_THREAD_POOL_SIZE, 4,
-      MHD_OPTION_END);
-
-  if (daemon) {
-    if (pthread_mutex_init(&mutex, NULL) != 0) {
-      printf("Failed to initialize the mutex\n");
-      return 1;
-    }
-
-    create_pool();
-    printf("Server running on port %d\n", PORT);
-    getchar();
+void sighandler(int signum) {
+  if (signum == SIGINT || signum == SIGTERM) {
+    printf("\nShutting down the service\n");
     close_pool();
     pthread_mutex_destroy(&mutex);
-
-    MHD_stop_daemon(daemon);
-  } else {
-    printf("Failed to start the server\n");
+    MHD_stop_daemon(main_daemon);
+    exit(0);
   }
-  return 0;
+}
+
+int main() {
+
+  char *ptr_port = getenv("PORT");
+  if (ptr_port == NULL) {
+    port = 8080;
+  } else {
+    port = atoi(ptr_port);
+  }
+
+  char *ptr_pool_size = getenv("POOL_SIZE");
+  if (ptr_pool_size != NULL) {
+    pool_size = atoi(ptr_pool_size);
+  } else {
+    pool_size = 10;
+  }
+
+  char *ptr_connection_string = getenv("CONNECTION_STRING");
+  if (ptr_connection_string != NULL) {
+    connection_string = malloc(strlen(ptr_connection_string));
+    strcpy(connection_string, ptr_connection_string);
+  } else {
+    connection_string = "postgres://postgres:postgres@localhost/rinha_backend_2024_q1_dev";
+  }
+
+  conn = (PGconn **)malloc(pool_size * sizeof(PGconn *));
+
+  main_daemon = MHD_start_daemon(
+      MHD_USE_EPOLL_INTERNAL_THREAD,
+      port, NULL, NULL, 
+      &handle_request, 
+      NULL, 
+      MHD_OPTION_CONNECTION_TIMEOUT, 30,
+      MHD_OPTION_THREAD_POOL_SIZE, pool_size,
+      MHD_OPTION_END);
+
+  if (!main_daemon) {
+    printf("Failed to start the server\n");
+    return 1;
+  }
+
+  if (signal(SIGINT, sighandler) == SIG_ERR) {
+    printf("Failed to set the signal handler\n");
+    return 1;
+  }
+
+  if (signal(SIGTERM, sighandler) == SIG_ERR) {
+    printf("Failed to set the signal handler\n");
+    return 1;
+  }
+
+  if (pthread_mutex_init(&mutex, NULL) != 0) {
+    printf("Failed to initialize the mutex\n");
+    return 1;
+  }
+
+  create_pool();
+  printf("Server running on port %d\n", port);
+
+  while (1);
 }
 
 
