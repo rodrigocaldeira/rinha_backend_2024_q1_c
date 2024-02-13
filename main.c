@@ -8,51 +8,81 @@
 #include <ctype.h>
 #include <pthread.h>
 #include <signal.h>
+#include <cJSON.h>
 
 int port;
 int pool_size;
-PGconn **conn;
+int threads;
 int conn_index = 0;
-pthread_mutex_t mutex;
 struct MHD_Daemon *main_daemon;
 char *connection_string;
 
+typedef struct {
+  PGconn *conn;
+  int em_uso;
+  pthread_mutex_t lock;
+} _connection;
+
+typedef struct {
+  _connection **connections;
+  pthread_mutex_t lock;
+} _pool;
+
+_pool *pool;
+
 void create_pool() {
   printf("Creating the connection pool of size %d\n", pool_size);
+
+  PQinitOpenSSL(0, 0);
+  PQinitSSL(0);
+
+  pool = (_pool *)malloc(sizeof(_pool));
+  pool -> connections = (_connection **)malloc(pool_size * sizeof(_connection *));
+  pthread_mutex_init(&pool->lock, NULL);
+
   for (int i = 0; i < pool_size; i++) {
-    conn[i] = PQconnectdb("postgres://postgres:postgres@localhost/rinha_backend_2024_q1_dev");
-    while (PQstatus(conn[i]) != CONNECTION_OK) {
-      printf("Failed to connect to the database: %s\n", PQerrorMessage(conn[i]));
-      sleep(1);
-      PQreset(conn[i]);
-    }
+    pool -> connections[i] = (_connection *)malloc(sizeof(_connection));
+    pool -> connections[i] -> conn = PQconnectdb(connection_string);
+    pool -> connections[i] -> em_uso = 0;
+    pthread_mutex_init(&pool->connections[i] -> lock, NULL);
   }
 }
 
 PGconn *get_connection() {
-  pthread_mutex_lock(&mutex);
-  if (conn_index == pool_size) {
-    conn_index = 0;
-  }
-  while (PQstatus(conn[conn_index]) == CONNECTION_BAD) {
-    printf("Connection %d is bad, resetting it\n", conn_index);
-    PQreset(conn[conn_index]);
-    conn_index++;
-    if (conn_index == pool_size) {
-      conn_index = 0;
+  pthread_mutex_lock(&pool->lock);
+  for (int i = 0; i < pool_size; i++) {
+    if (!pool->connections[i] -> em_uso) {
+      pthread_mutex_lock(&pool->connections[i] -> lock);
+      pool->connections[i] -> em_uso = 1;
+      pthread_mutex_unlock(&pool->lock);
+      return pool->connections[i] -> conn;
     }
   }
-  PGconn *pg_conn = conn[conn_index];
-  conn_index++;
-  pthread_mutex_unlock(&mutex);
-  return pg_conn;
+  pthread_mutex_unlock(&pool->lock);
+  return NULL;
+}
+
+void release_connection(PGconn *conn) {
+  pthread_mutex_lock(&pool->lock);
+  for (int i = 0; i < pool_size; i++) {
+    if (pool->connections[i] -> conn == conn) {
+      pool->connections[i] -> em_uso = 0;
+      pthread_mutex_unlock(&pool->connections[i] -> lock);
+      pthread_mutex_unlock(&pool->lock);
+      return;
+    }
+  }
+  pthread_mutex_unlock(&pool->lock);
 }
 
 void close_pool() {
   printf("Closing the connection pool\n");
   for (int i = 0; i < pool_size; i++) {
-    PQfinish(conn[i]);
+    PQfinish(pool->connections[i] -> conn);
+    pthread_mutex_destroy(&pool->connections[i] -> lock);
   }
+  pthread_mutex_destroy(&pool->lock);
+  free(pool);
 }
 
 struct transacao {
@@ -76,7 +106,6 @@ struct post_status {
 };
 
 int send_response(struct MHD_Connection *connection, const char *response, int http_code) {
-  printf("%s\n", response);
   struct MHD_Response *mhd_response = MHD_create_response_from_buffer(strlen(response), (void *)response, MHD_RESPMEM_PERSISTENT);
   MHD_add_response_header(mhd_response, "Content-Type", "application/json");
   MHD_add_response_header(mhd_response, "Connection", "keep-alive");
@@ -97,7 +126,7 @@ void now(char *dt) {
 void monta_ultimas_transacoes(struct transacao transacoes_array[11], char *ultimas_transacoes) {
   char transacoes[2000];
   char *token = ultimas_transacoes;
-
+  
   int i = 0;
   while (*token) {
     switch (*token) {
@@ -134,62 +163,22 @@ void monta_ultimas_transacoes(struct transacao transacoes_array[11], char *ultim
     return;
   }
 
-  char *token_saveptr = NULL;
-  char *token2 = strtok_r(transacoes, "[},{]", &token_saveptr);
-  char *key_value_saveptr = NULL;
+  cJSON *json = cJSON_Parse(ultimas_transacoes);
+  
+  int j = 0;
+  cJSON *item = NULL;
+  cJSON_ArrayForEach(item, json) {
+    cJSON *valor = cJSON_GetObjectItem(item, "valor");
+    cJSON *tipo = cJSON_GetObjectItem(item, "tipo");
+    cJSON *descricao = cJSON_GetObjectItem(item, "descricao");
+    cJSON *realizada_em = cJSON_GetObjectItem(item, "realizada_em");
 
-  i = 0;
-  int valores = 0;
-  while (token2) {
-    char key_value[100];
-    strcpy(key_value, token2);
-
-    char *key = strtok_r(key_value, ":", &key_value_saveptr);
-    while (*key != '"')
-      key++;
-    char *value = strtok_r(NULL, ":", &key_value_saveptr);
-
-    char *key_saveptr = NULL;
-    char *key_token = strtok_r(key, "\"", &key_saveptr);
-
-    while (!key_token) {
-      token2 = strtok_r(NULL, "[},{]", &token_saveptr);
-    }
-
-    if (strcmp(key_token, "valor") == 0) {
-      strcpy(transacoes_array[i].valor, value);
-      valores++;
-    } else if (strcmp(key_token, "tipo") == 0) {
-      transacoes_array[i].tipo = value[2];
-      valores++;
-    } else if (strcmp(key_token, "descricao") == 0) {
-      char *descricao_saveptr = NULL;
-      char *token_descricao = strtok_r(value, "\"", &descricao_saveptr);
-      token_descricao = strtok_r(NULL, "\"", &descricao_saveptr);
-      strcpy(transacoes_array[i].descricao, token_descricao);
-      valores++;
-    } else if (strcmp(key_token, "realizada_em") == 0) {
-      char *token_realizada_em_2 = strtok_r(NULL, ":" , &key_value_saveptr);
-      char *token_realizada_em_3 = strtok_r(NULL, ":" , &key_value_saveptr);
-
-      char realizada_em[28];
-      char *realizada_em_saveptr = NULL;
-      char *token_realizada_em = strtok_r(value, "\"", &realizada_em_saveptr);
-      
-      token_realizada_em = strtok_r(NULL, "\"", &realizada_em_saveptr);
-      sprintf(realizada_em, "%s:%s:%s", token_realizada_em, token_realizada_em_2, token_realizada_em_3);
-      realizada_em[strlen(realizada_em) - 1] = '\0';
-      strcpy(transacoes_array[i].realizada_em, realizada_em);
-      valores++;
-    }
-
-    if (valores == 4) {
-      transacoes_array[i].em_uso = 1;
-      valores = 0;
-      i++;
-    }
-
-    token2 = strtok_r(NULL, "[},{]", &token_saveptr);
+    sprintf(transacoes_array[j].valor, "%d", valor -> valueint);
+    transacoes_array[j].tipo = tipo -> valuestring[0];
+    strcpy(transacoes_array[j].descricao, descricao -> valuestring);
+    strcpy(transacoes_array[j].realizada_em, realizada_em -> valuestring);
+    transacoes_array[j].em_uso = 1;
+    j++;
   }
 }
 
@@ -239,6 +228,7 @@ int get_cliente(struct cliente *c, char *id) {
   c -> saldo = atoi(PQgetvalue(res, 0, 0));
   c -> limite = atoi(PQgetvalue(res, 0, 1));
   PQclear(res);
+  release_connection(pg_conn);
   return 0;
 }
 
@@ -296,18 +286,28 @@ int salva_cliente(struct cliente *c, struct transacao t) {
 
   PGconn *pg_conn = get_connection();
 
-  PQexec(pg_conn, "BEGIN");
   PGresult *res = PQexec(pg_conn, query);
   if (PQresultStatus(res) != PGRES_COMMAND_OK) {
     printf("Failed to execute the query: %s\n", PQerrorMessage(pg_conn));
     PQclear(res);
-    PQexec(pg_conn, "ROLLBACK");
+    release_connection(pg_conn);
     return 0;
   }
 
   PQclear(res);
-  PQexec(pg_conn, "COMMIT");
+  release_connection(pg_conn);
   return 1;
+}
+
+struct cliente *inicia_cliente() {
+  struct cliente *c = (struct cliente *)malloc(sizeof(struct cliente));
+  for (int i = 0; i < 10; i++) {
+    c -> ultimas_transacoes[i].em_uso = 0;
+  }
+  c -> id[0] = '\0';
+  c -> saldo = 0;
+  c -> limite = 0;
+  return c;
 }
 
 void parse_transacao(struct transacao *t, const char *data) {
@@ -315,65 +315,25 @@ void parse_transacao(struct transacao *t, const char *data) {
 
   while (*data_copy != '{')
     data_copy++;
-  data_copy++;
 
-  char *token_saveptr = NULL;
-  char *token = strtok_r((char *)data_copy, "\n", &token_saveptr);
-  char trimmed_data[1024];
+  cJSON *json = cJSON_Parse(data_copy);
+  cJSON *valor = cJSON_GetObjectItem(json, "valor");
+  cJSON *tipo = cJSON_GetObjectItem(json, "tipo");
+  cJSON *descricao = cJSON_GetObjectItem(json, "descricao");
 
-  while (token) {
-    char *trimmed_token = (char *)malloc(strlen(token) + 1);
-    int i = 0;
-    while (isspace(token[i]) || isblank(token[i])) {
-      i++;
-    }
-    strcpy(trimmed_token, token + i);
-
-    char *end = trimmed_token + strlen(trimmed_token) - 1;
-    while (end > trimmed_token && isspace(*end) || isblank(*end)) {
-      end--;
-    }
-    end[1] = '\0';
-
-    strcat(trimmed_data, trimmed_token);
-    free(trimmed_token);
-    token = strtok_r(NULL, "\n",&token_saveptr);
+  double valor_double = valor -> valuedouble;
+  if (valor_double - (int)valor_double > 0) {
+    sprintf(t -> valor, "%.2f", valor -> valuedouble);
+  } else {
+    sprintf(t -> valor, "%d", valor -> valueint);
   }
 
-  trimmed_data[strlen(trimmed_data) - 1] = '\0'; 
-  char *trimmed_data_saveptr = NULL;
-  char *key_value_saveptr = NULL;
+  t -> tipo = tipo -> valuestring[0];
+  if (descricao -> valuestring)
+    strcpy(t -> descricao, descricao -> valuestring);
 
-  token = strtok_r(trimmed_data, ",", &trimmed_data_saveptr);
-  while (token) {
-    char *key = strtok_r(token, ":", &key_value_saveptr);
-    while (*key != '"')
-      key++;
-    char *value = strtok_r(NULL, ":", &key_value_saveptr);
+  cJSON_Delete(json);
 
-    char *key_saveptr = NULL;
-    char *key_token = strtok_r(key, "\"", &key_saveptr);
-    while (!key_token) {
-      token = strtok_r(NULL, ",", &key_saveptr);
-    }
-
-    if (strcmp(key_token, "valor") == 0) {
-      strcpy(t -> valor, value);
-    } else if (strcmp(key_token, "tipo") == 0) {
-      char *tipo_saveptr = NULL;
-      char *token_tipo = strtok_r(value, "\"", &tipo_saveptr);
-      token_tipo = strtok_r(NULL, "\"", &tipo_saveptr);
-      t -> tipo = token_tipo[0];
-    } else if (strcmp(key_token, "descricao") == 0) {
-      char *descricao_saveptr = NULL;
-      char *token_descricao = strtok_r(value, "\"", &descricao_saveptr);
-      token_descricao = strtok_r(NULL, "\"", &descricao_saveptr);
-      if (token_descricao != NULL) {
-        strcpy(t -> descricao, token_descricao);
-      }
-    }
-    token = strtok_r(NULL, ",", &trimmed_data_saveptr);
-  }
   now(t -> realizada_em);
 }
 
@@ -455,8 +415,6 @@ enum MHD_Result handle_request(void *cls, struct MHD_Connection *connection, con
         while (*data != '{')
           data++;
 
-        printf("%s\n", data);
-
         struct transacao t;
         parse_transacao(&t, data);
         
@@ -468,7 +426,7 @@ enum MHD_Result handle_request(void *cls, struct MHD_Connection *connection, con
 
         free(post);
 
-        struct cliente *c = (struct cliente *)malloc(sizeof(struct cliente));
+        struct cliente *c = inicia_cliente();
 
         switch (get_cliente(c, id)) {
           case 0: 
@@ -495,8 +453,8 @@ enum MHD_Result handle_request(void *cls, struct MHD_Connection *connection, con
 
               char response[2000];
               sprintf(response, "{\"limite\": %d,\"saldo\": %d}", c->limite, c->saldo);
-              enum MHD_Result result = send_response(connection, response, 200);
               free(c);
+              enum MHD_Result result = send_response(connection, response, 200);
               return result;
             }
           case -1:
@@ -530,7 +488,7 @@ enum MHD_Result handle_request(void *cls, struct MHD_Connection *connection, con
       return send_response(connection, "{\"error\": \"Invalid URL\"}", 400);
     }
 
-    struct cliente *c = (struct cliente *)malloc(sizeof(struct cliente));
+    struct cliente *c = inicia_cliente();
 
     switch (get_cliente(c, id)) {
       case 0: 
@@ -574,7 +532,6 @@ void sighandler(int signum) {
   if (signum == SIGINT || signum == SIGTERM) {
     printf("\nShutting down the service\n");
     close_pool();
-    pthread_mutex_destroy(&mutex);
     MHD_stop_daemon(main_daemon);
     exit(0);
   }
@@ -596,6 +553,13 @@ int main() {
     pool_size = 10;
   }
 
+  char *ptr_threads = getenv("THREADS");
+  if (ptr_threads != NULL) {
+    threads = atoi(ptr_threads);
+  } else {
+    threads = 2;
+  }
+
   char *ptr_connection_string = getenv("CONNECTION_STRING");
   if (ptr_connection_string != NULL) {
     connection_string = malloc(strlen(ptr_connection_string));
@@ -604,20 +568,20 @@ int main() {
     connection_string = "postgres://postgres:postgres@localhost/rinha_backend_2024_q1_dev";
   }
 
-  conn = (PGconn **)malloc(pool_size * sizeof(PGconn *));
-
   main_daemon = MHD_start_daemon(
       MHD_USE_EPOLL_INTERNAL_THREAD,
       port, NULL, NULL, 
       &handle_request, 
       NULL, 
       MHD_OPTION_CONNECTION_TIMEOUT, 30,
-      MHD_OPTION_THREAD_POOL_SIZE, pool_size,
+      MHD_OPTION_THREAD_POOL_SIZE, threads,
       MHD_OPTION_END);
 
   if (!main_daemon) {
     printf("Failed to start the server\n");
     return 1;
+  } else {
+    printf("Threads: %d\n", threads);
   }
 
   if (signal(SIGINT, sighandler) == SIG_ERR) {
@@ -630,15 +594,9 @@ int main() {
     return 1;
   }
 
-  if (pthread_mutex_init(&mutex, NULL) != 0) {
-    printf("Failed to initialize the mutex\n");
-    return 1;
-  }
-
   create_pool();
-  printf("Server running on port %d\n", port);
+  printf("Server running on port %d.\n", port);
 
   while (1);
 }
-
 
