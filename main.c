@@ -12,10 +12,7 @@
 
 int port;
 int pool_size;
-int threads;
-int conn_index = 0;
 struct MHD_Daemon *main_daemon;
-char *connection_string;
 
 typedef struct {
   PGconn *conn;
@@ -28,87 +25,88 @@ typedef struct {
   pthread_mutex_t lock;
 } _pool;
 
-_pool *pool;
-
-void create_pool() {
-  printf("Creating the connection pool of size %d\n", pool_size);
-
-  PQinitOpenSSL(0, 0);
-  PQinitSSL(0);
-
-  pool = (_pool *)malloc(sizeof(_pool));
-  pool -> connections = (_connection **)malloc(pool_size * sizeof(_connection *));
-  pthread_mutex_init(&pool->lock, NULL);
-
-  for (int i = 0; i < pool_size; i++) {
-    pool -> connections[i] = (_connection *)malloc(sizeof(_connection));
-    pool -> connections[i] -> conn = PQconnectdb(connection_string);
-    pool -> connections[i] -> em_uso = 0;
-    pthread_mutex_init(&pool->connections[i] -> lock, NULL);
-  }
-}
-
-PGconn *get_connection() {
-  pthread_mutex_lock(&pool->lock);
-  for (int i = 0; i < pool_size; i++) {
-    if (!pool->connections[i] -> em_uso) {
-      pthread_mutex_lock(&pool->connections[i] -> lock);
-      pool->connections[i] -> em_uso = 1;
-      pthread_mutex_unlock(&pool->lock);
-      return pool->connections[i] -> conn;
-    }
-  }
-  pthread_mutex_unlock(&pool->lock);
-  return NULL;
-}
-
-void release_connection(PGconn *conn) {
-  pthread_mutex_lock(&pool->lock);
-  for (int i = 0; i < pool_size; i++) {
-    if (pool->connections[i] -> conn == conn) {
-      pool->connections[i] -> em_uso = 0;
-      pthread_mutex_unlock(&pool->connections[i] -> lock);
-      pthread_mutex_unlock(&pool->lock);
-      return;
-    }
-  }
-  pthread_mutex_unlock(&pool->lock);
-}
-
-void close_pool() {
-  printf("Closing the connection pool\n");
-  for (int i = 0; i < pool_size; i++) {
-    PQfinish(pool->connections[i] -> conn);
-    pthread_mutex_destroy(&pool->connections[i] -> lock);
-  }
-  pthread_mutex_destroy(&pool->lock);
-  free(pool);
-}
-
-struct transacao {
+typedef struct {
   char valor[11];
   char tipo;
   char descricao[11];
   char realizada_em[28];
   int em_uso;
-};
+} transacao;
 
-struct cliente {
+typedef struct {
   char id[2];
   int saldo;
   int limite;
-  struct transacao ultimas_transacoes[10];
-};
+  transacao ultimas_transacoes[10];
+} cliente;
 
 struct post_status {
   int status;
   char data[1024];
 };
 
-int send_response(struct MHD_Connection *connection, const char *response, int http_code) {
-  struct MHD_Response *mhd_response = MHD_create_response_from_buffer(strlen(response), (void *)response, MHD_RESPMEM_PERSISTENT);
+_pool pool;
+
+void create_pool(char *connection_string) {
+  printf("Creating the connection pool of size %d\n", pool_size);
+
+  pool.connections = malloc(pool_size * sizeof(_connection *));
+  pthread_mutex_init(&pool.lock, NULL);
+
+  for (int i = 0; i < pool_size; i++) {
+    pool.connections[i] = (_connection *)calloc(1, sizeof(_connection));
+    pool.connections[i] -> conn = PQconnectdb(connection_string);
+    pool.connections[i] -> em_uso = 0;
+    pthread_mutex_init(&pool.connections[i] -> lock, NULL);
+  }
+}
+
+PGconn *get_connection() {
+  pthread_mutex_lock(&pool.lock);
+  PGconn *pg_conn = NULL;
+  while (pg_conn == NULL) {
+    for (int i = 0; i < pool_size; i++) {
+      if (!pool.connections[i] -> em_uso) {
+        pthread_mutex_lock(&pool.connections[i] -> lock);
+        pool.connections[i] -> em_uso = 1;
+        pg_conn = pool.connections[i] -> conn;
+        break;
+      }
+    }
+  }
+  pthread_mutex_unlock(&pool.lock);
+  return pg_conn;
+}
+
+void release_connection(PGconn *conn) {
+  pthread_mutex_lock(&pool.lock);
+  for (int i = 0; i < pool_size; i++) {
+    if (pool.connections[i] -> conn == conn) {
+      pool.connections[i] -> em_uso = 0;
+      pthread_mutex_unlock(&pool.connections[i] -> lock);
+      break;
+    }
+  }
+  pthread_mutex_unlock(&pool.lock);
+}
+
+void close_pool() {
+  printf("Closing the connection pool\n");
+  for (int i = 0; i < pool_size; i++) {
+    PQfinish(pool.connections[i] -> conn);
+    pthread_mutex_destroy(&pool.connections[i] -> lock);
+  }
+  pthread_mutex_destroy(&pool.lock);
+}
+
+
+int send_response(struct MHD_Connection *connection, const char *response, int http_code, int free_response) {
+  enum MHD_ResponseMemoryMode mode = free_response ? MHD_RESPMEM_MUST_FREE : MHD_RESPMEM_PERSISTENT;
+  struct MHD_Response *mhd_response = MHD_create_response_from_buffer(strlen(response), (void *)response, mode);
+
   MHD_add_response_header(mhd_response, "Content-Type", "application/json");
   MHD_add_response_header(mhd_response, "Connection", "keep-alive");
+
   int ret = MHD_queue_response(connection, http_code, mhd_response);
   MHD_destroy_response(mhd_response);
 
@@ -123,7 +121,7 @@ void now(char *dt) {
   sprintf(dt, "%d-%02d-%02dT%02d:%02d:%02d.%06dZ", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec, (int)tv.tv_usec);
 }
 
-void monta_ultimas_transacoes(struct transacao transacoes_array[11], char *ultimas_transacoes) {
+void monta_ultimas_transacoes(transacao transacoes_array[10], char *ultimas_transacoes) {
   char transacoes[2000];
   char *token = ultimas_transacoes;
   
@@ -163,7 +161,12 @@ void monta_ultimas_transacoes(struct transacao transacoes_array[11], char *ultim
     return;
   }
 
-  cJSON *json = cJSON_Parse(ultimas_transacoes);
+  cJSON *json = cJSON_Parse(transacoes);
+
+  if (json == NULL) {
+    fprintf(stderr, "Failed to parse the JSON data\n");
+    return;
+  }
   
   int j = 0;
   cJSON *item = NULL;
@@ -175,11 +178,15 @@ void monta_ultimas_transacoes(struct transacao transacoes_array[11], char *ultim
 
     sprintf(transacoes_array[j].valor, "%d", valor -> valueint);
     transacoes_array[j].tipo = tipo -> valuestring[0];
-    strcpy(transacoes_array[j].descricao, descricao -> valuestring);
-    strcpy(transacoes_array[j].realizada_em, realizada_em -> valuestring);
+    strncpy(transacoes_array[j].descricao, descricao -> valuestring, 10);
+    transacoes_array[j].descricao[10] = '\0';
+    strncpy(transacoes_array[j].realizada_em, realizada_em -> valuestring, 27);
+    transacoes_array[j].realizada_em[27] = '\0';
     transacoes_array[j].em_uso = 1;
     j++;
   }
+
+  cJSON_Delete(json);
 }
 
 void get_cliente_id(char *id, const char *url, char *regex_expression) {
@@ -204,7 +211,7 @@ void get_cliente_id(char *id, const char *url, char *regex_expression) {
     regfree(&regex);
 }
 
-int get_cliente(struct cliente *c, char *id) {
+int get_cliente(cliente *c, char *id) {
   char query[70];
   sprintf(query, "select saldo, limite, ultimas_transacoes from clientes where id = %s", id);
 
@@ -213,18 +220,20 @@ int get_cliente(struct cliente *c, char *id) {
   if (PQresultStatus(res) != PGRES_TUPLES_OK) {
     printf("Failed to execute the query: %s\n", PQerrorMessage(pg_conn));
     PQclear(res);
+    release_connection(pg_conn);
     return -2;
   }
 
   if (PQntuples(res) == 0) {
     PQclear(res);
+    release_connection(pg_conn);
     return -3;
   }
 
   char *transacoes = PQgetvalue(res, 0, 2);
 
   monta_ultimas_transacoes(c -> ultimas_transacoes, transacoes);
-  strcpy(c -> id, id);
+  strncpy(c -> id, id, 2);
   c -> saldo = atoi(PQgetvalue(res, 0, 0));
   c -> limite = atoi(PQgetvalue(res, 0, 1));
   PQclear(res);
@@ -232,7 +241,7 @@ int get_cliente(struct cliente *c, char *id) {
   return 0;
 }
 
-void serializar_transacoes(char *transacoes, struct cliente *c) {
+void serializar_transacoes(char *transacoes, cliente *c) {
   if (!c -> ultimas_transacoes[0].em_uso) {
     transacoes[0] = '{';
     transacoes[1] = '}';
@@ -243,7 +252,7 @@ void serializar_transacoes(char *transacoes, struct cliente *c) {
   transacoes[0] = '{';
   transacoes[1] = '\0';
   int i = 0;
-  while (c -> ultimas_transacoes[i].em_uso) {
+  while (i < 10 && c -> ultimas_transacoes[i].em_uso) {
     char transacao[200];
     sprintf(transacao, 
         "\"{\\\"valor\\\":%s,\\\"tipo\\\":\\\"%c\\\",\\\"descricao\\\":\\\"%s\\\",\\\"realizada_em\\\":\\\"%s\\\"}\",", 
@@ -260,24 +269,25 @@ void serializar_transacoes(char *transacoes, struct cliente *c) {
   transacoes[strlen(transacoes)] = '\0';
 }
 
-int salva_cliente(struct cliente *c, struct transacao t) {
+int salva_cliente(cliente *c, transacao t) {
   char query[2000];
   if (!c -> ultimas_transacoes[0].em_uso) {
-    c -> ultimas_transacoes[0] = t;
+    memcpy(&c -> ultimas_transacoes[0], &t, sizeof(transacao));
     c -> ultimas_transacoes[0].em_uso = 1;
   } else {
     int i = 0;
-    while (c -> ultimas_transacoes[i].em_uso && i < 9) {
+    while (i < 8 && c -> ultimas_transacoes[i].em_uso) {
       i++;
     }
+
     c -> ultimas_transacoes[i + 1].em_uso = 0;
 
     while (i >= 1) {
-      c -> ultimas_transacoes[i] = c -> ultimas_transacoes[i - 1];
+      memcpy(&c -> ultimas_transacoes[i], &c -> ultimas_transacoes[i - 1], sizeof(transacao));
       i--;
     }
 
-    c -> ultimas_transacoes[0] = t;
+    memcpy(&c -> ultimas_transacoes[0], &t, sizeof(transacao));
   }
 
   char ultimas_transacoes[2000];
@@ -299,24 +309,21 @@ int salva_cliente(struct cliente *c, struct transacao t) {
   return 1;
 }
 
-struct cliente *inicia_cliente() {
-  struct cliente *c = (struct cliente *)malloc(sizeof(struct cliente));
-  for (int i = 0; i < 10; i++) {
-    c -> ultimas_transacoes[i].em_uso = 0;
+cliente *inicia_cliente() {
+  cliente *c = (cliente *)calloc(1, sizeof(cliente));
+  if (c == NULL) {
+    fprintf(stderr, "Failed to allocate memory for the client\n");
   }
-  c -> id[0] = '\0';
-  c -> saldo = 0;
-  c -> limite = 0;
   return c;
 }
 
-void parse_transacao(struct transacao *t, const char *data) {
-  char *data_copy = (char *)data;
+void parse_transacao(transacao *t, char *data) {
+  cJSON *json = cJSON_Parse(data);
+  if (json == NULL) {
+    fprintf(stderr, "Failed to parse the JSON data\n");
+    return;
+  }
 
-  while (*data_copy != '{')
-    data_copy++;
-
-  cJSON *json = cJSON_Parse(data_copy);
   cJSON *valor = cJSON_GetObjectItem(json, "valor");
   cJSON *tipo = cJSON_GetObjectItem(json, "tipo");
   cJSON *descricao = cJSON_GetObjectItem(json, "descricao");
@@ -329,31 +336,36 @@ void parse_transacao(struct transacao *t, const char *data) {
   }
 
   t -> tipo = tipo -> valuestring[0];
-  if (descricao -> valuestring)
-    strcpy(t -> descricao, descricao -> valuestring);
+  if (descricao -> valuestring != NULL && strlen(descricao -> valuestring) <= 10){
+    strncpy(t -> descricao, descricao -> valuestring, 10);
+    t -> descricao[10] = '\0';
+  } else {
+    t -> descricao[0] = '\0';
+  }
 
   cJSON_Delete(json);
 
   now(t -> realizada_em);
+  t -> em_uso = 1;
 }
 
-int valida_transacao(struct transacao t) {
-  if (strlen(t.valor) == 0 || strchr(t.valor, '.') > 0) {
+int valida_transacao(transacao *t) {
+  if (strlen(t -> valor) == 0 || strchr(t -> valor, '.') > 0) {
     return 0;
   }
 
-  if (t.tipo != 'c' && t.tipo != 'd') {
+  if (t -> tipo != 'c' && t -> tipo != 'd') {
     return 0;
   }
 
-  if (strlen(t.descricao) == 0 || strlen(t.descricao) > 10){
+  if (strlen(t -> descricao) == 0){
     return 0;
   }
 
   return 1;
 }
 
-void serializa_ultimas_transacoes(char *transacoes, struct cliente *c) {
+void serializa_ultimas_transacoes(char *transacoes, cliente *c) {
   if (!c -> ultimas_transacoes[0].em_uso) {
     transacoes[0] = '[';
     transacoes[1] = ']';
@@ -387,13 +399,12 @@ enum MHD_Result handle_request(void *cls, struct MHD_Connection *connection, con
     struct post_status *post = (struct post_status *)*con_cls;
 
     if (!post) {
-      post = (struct post_status *)malloc(sizeof(struct post_status));
-      post->status = 0;
+      post = (struct post_status *)calloc(1, sizeof(struct post_status));
       *con_cls = post;
     }
 
     if (!post->status) {
-      post->status = 1;
+      post -> status = 1;
       return MHD_YES;
     } else {
       if (*upload_data_size) {
@@ -406,27 +417,26 @@ enum MHD_Result handle_request(void *cls, struct MHD_Connection *connection, con
         get_cliente_id(id, url, "\\/clientes\\/([0-9]+)\\/transacoes");
 
         if (strcmp(id, "0") == 0) {
-          return send_response(connection, "{\"error\": \"Invalid URL\"}", 400);
+          return send_response(connection, "{\"error\": \"Invalid URL\"}", 400, 0);
         }
 
-        char *data = (char *)malloc(strlen(post -> data) + 1);
-        strcpy(data, post -> data);
+        char *data = (char *)calloc(1, 1024);
+        strncpy(data, post -> data, 1024);
         char *ptr_data = data;
-        while (*data != '{')
-          data++;
+        while (*ptr_data != '{')
+          ptr_data++;
 
-        struct transacao t;
-        parse_transacao(&t, data);
+        transacao t;
+        parse_transacao(&t, ptr_data);
         
-        free(ptr_data);
-
-        if (!valida_transacao(t)) {
-          return send_response(connection, "{\"error\": \"Unprocessable Entity\"}", 422);
-        }
-
+        free(data);
         free(post);
 
-        struct cliente *c = inicia_cliente();
+        if (!valida_transacao(&t)) {
+          return send_response(connection, "{\"error\": \"Unprocessable Entity\"}", 422, 0);
+        }
+
+        cliente *c = inicia_cliente();
 
         switch (get_cliente(c, id)) {
           case 0: 
@@ -439,37 +449,39 @@ enum MHD_Result handle_request(void *cls, struct MHD_Connection *connection, con
                 novo_saldo -= atoi(t.valor);
               }
 
-              if (novo_saldo < -c->limite) {
+              if (novo_saldo < -c -> limite) {
                 free(c);
-                return send_response(connection, "{\"error\": \"Insufficient funds\"}", 422);
+                return send_response(connection, "{\"error\": \"Insufficient funds\"}", 422, 0);
               }
 
               c -> saldo = novo_saldo;
 
               if (!salva_cliente(c, t)) {
                 free(c);
-                return send_response(connection, "{\"error\": \"Failed to save the client\"}", 500);
+                return send_response(connection, "{\"error\": \"Failed to save the client\"}", 500, 0);
               }
 
-              char response[2000];
+              char *response = (char *)calloc(1, 2000);
               sprintf(response, "{\"limite\": %d,\"saldo\": %d}", c->limite, c->saldo);
               free(c);
-              enum MHD_Result result = send_response(connection, response, 200);
-              return result;
+              return send_response(connection, response, 200, 1);
             }
           case -1:
             {
-              return send_response(connection, "{\"error\": \"Failed to connect to the database\"}", 500);
+              free(c);
+              return send_response(connection, "{\"error\": \"Failed to connect to the database\"}", 500, 0);
             }
 
           case -2:
             {
-              return send_response(connection, "{\"error\": \"Failed to execute the query\"}", 500);
+              free(c);
+              return send_response(connection, "{\"error\": \"Failed to execute the query\"}", 500, 0);
             }
 
           case -3:
             {
-              return send_response(connection, "{\"error\": \"Client not found\"}", 404);
+              free(c);
+              return send_response(connection, "{\"error\": \"Client not found\"}", 404, 0);
             }
         }
 
@@ -485,10 +497,10 @@ enum MHD_Result handle_request(void *cls, struct MHD_Connection *connection, con
     get_cliente_id(id, url, "\\/clientes\\/([0-9]+)\\/extrato");
 
     if (strcmp(id, "0") == 0) {
-      return send_response(connection, "{\"error\": \"Invalid URL\"}", 400);
+      return send_response(connection, "{\"error\": \"Invalid URL\"}", 400, 0);
     }
 
-    struct cliente *c = inicia_cliente();
+    cliente *c = inicia_cliente();
 
     switch (get_cliente(c, id)) {
       case 0: 
@@ -496,36 +508,34 @@ enum MHD_Result handle_request(void *cls, struct MHD_Connection *connection, con
         char data_extrato[28];
         now(data_extrato);
 
-        char response[2000];
+        char *response = (char *)calloc(1, 2000);
 
         char transacoes[2000];
         serializa_ultimas_transacoes(transacoes, c);
 
         sprintf(response, "{\"saldo\":{\"total\":%d,\"limite\":%d,\"data_extrato\":\"%s\"},\"ultimas_transacoes\":%s}", c->saldo, c->limite, data_extrato, transacoes);
 
-        enum MHD_Result result = send_response(connection, response, 200);
-
         free(c);
 
-        return result;
+        return send_response(connection, response, 200, 1);
       }
       case -1:
       {
-        return send_response(connection, "{\"error\": \"Failed to connect to the database\"}", 500);
+        return send_response(connection, "{\"error\": \"Failed to connect to the database\"}", 500, 0);
       }
 
       case -2:
       {
-        return send_response(connection, "{\"error\": \"Failed to execute the query\"}", 500);
+        return send_response(connection, "{\"error\": \"Failed to execute the query\"}", 500, 0);
       }
 
       case -3:
       {
-        return send_response(connection, "{\"error\": \"Client not found\"}", 404);
+        return send_response(connection, "{\"error\": \"Client not found\"}", 404, 0);
       }
     }
   }
-  return send_response(connection, "{\"error\": \"Invalid Request\"}", 400);
+  return send_response(connection, "{\"error\": \"Invalid Request\"}", 400, 0);
 }
 
 void sighandler(int signum) {
@@ -538,7 +548,6 @@ void sighandler(int signum) {
 }
 
 int main() {
-
   char *ptr_port = getenv("PORT");
   if (ptr_port == NULL) {
     port = 8080;
@@ -554,35 +563,13 @@ int main() {
   }
 
   char *ptr_threads = getenv("THREADS");
+  int threads = 2;
+
   if (ptr_threads != NULL) {
     threads = atoi(ptr_threads);
-  } else {
-    threads = 2;
   }
 
-  char *ptr_connection_string = getenv("CONNECTION_STRING");
-  if (ptr_connection_string != NULL) {
-    connection_string = malloc(strlen(ptr_connection_string));
-    strcpy(connection_string, ptr_connection_string);
-  } else {
-    connection_string = "postgres://postgres:postgres@localhost/rinha_backend_2024_q1_dev";
-  }
-
-  main_daemon = MHD_start_daemon(
-      MHD_USE_EPOLL_INTERNAL_THREAD,
-      port, NULL, NULL, 
-      &handle_request, 
-      NULL, 
-      MHD_OPTION_CONNECTION_TIMEOUT, 30,
-      MHD_OPTION_THREAD_POOL_SIZE, threads,
-      MHD_OPTION_END);
-
-  if (!main_daemon) {
-    printf("Failed to start the server\n");
-    return 1;
-  } else {
-    printf("Threads: %d\n", threads);
-  }
+  char *connection_string = getenv("CONNECTION_STRING");
 
   if (signal(SIGINT, sighandler) == SIG_ERR) {
     printf("Failed to set the signal handler\n");
@@ -594,7 +581,26 @@ int main() {
     return 1;
   }
 
-  create_pool();
+  create_pool(connection_string);
+  // free(connection_string);
+
+  main_daemon = MHD_start_daemon(
+      MHD_USE_EPOLL_INTERNAL_THREAD | MHD_USE_EPOLL_TURBO,
+      port, NULL, NULL, 
+      &handle_request, 
+      NULL, 
+      MHD_OPTION_CONNECTION_TIMEOUT, 30,
+      MHD_OPTION_THREAD_POOL_SIZE, threads,
+      MHD_OPTION_LISTENING_ADDRESS_REUSE, 1,
+      MHD_OPTION_END);
+
+  if (!main_daemon) {
+    printf("Failed to start the server\n");
+    return 1;
+  } else {
+    printf("Threads: %d\n", threads);
+  }
+
   printf("Server running on port %d.\n", port);
 
   while (1);
