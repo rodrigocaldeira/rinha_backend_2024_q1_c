@@ -47,8 +47,9 @@ struct post_status {
 
 _pool pool;
 
-void create_pool(char *connection_string) {
+int create_pool(char *connection_string) {
   printf("Creating the connection pool of size %d\n", pool_size);
+  fflush(stdout);
 
   pool.connections = malloc(pool_size * sizeof(_connection *));
   pthread_mutex_init(&pool.lock, NULL);
@@ -56,9 +57,15 @@ void create_pool(char *connection_string) {
   for (int i = 0; i < pool_size; i++) {
     pool.connections[i] = (_connection *)calloc(1, sizeof(_connection));
     pool.connections[i] -> conn = PQconnectdb(connection_string);
+    if (PQstatus(pool.connections[i] -> conn) != CONNECTION_OK) {
+      fprintf(stderr, "Failed to connect to the database: %s\n", PQerrorMessage(pool.connections[i] -> conn));
+      return 1;
+    }
     pool.connections[i] -> em_uso = 0;
     pthread_mutex_init(&pool.connections[i] -> lock, NULL);
   }
+
+  return 0;
 }
 
 PGconn *get_connection() {
@@ -92,6 +99,7 @@ void release_connection(PGconn *conn) {
 
 void close_pool() {
   printf("Closing the connection pool\n");
+  fflush(stdout);
   for (int i = 0; i < pool_size; i++) {
     PQfinish(pool.connections[i] -> conn);
     pthread_mutex_destroy(&pool.connections[i] -> lock);
@@ -218,7 +226,7 @@ int get_cliente(cliente *c, char *id) {
   PGconn *pg_conn = get_connection();
   PGresult *res = PQexec(pg_conn, query);
   if (PQresultStatus(res) != PGRES_TUPLES_OK) {
-    printf("Failed to execute the query: %s\n", PQerrorMessage(pg_conn));
+    fprintf(stderr, "Failed to execute the query: %s\n", PQerrorMessage(pg_conn));
     PQclear(res);
     release_connection(pg_conn);
     return -2;
@@ -298,7 +306,7 @@ int salva_cliente(cliente *c, transacao t) {
 
   PGresult *res = PQexec(pg_conn, query);
   if (PQresultStatus(res) != PGRES_COMMAND_OK) {
-    printf("Failed to execute the query: %s\n", PQerrorMessage(pg_conn));
+    fprintf(stderr, "Failed to execute the query: %s\n", PQerrorMessage(pg_conn));
     PQclear(res);
     release_connection(pg_conn);
     return 0;
@@ -541,6 +549,7 @@ enum MHD_Result handle_request(void *cls, struct MHD_Connection *connection, con
 void sighandler(int signum) {
   if (signum == SIGINT || signum == SIGTERM) {
     printf("\nShutting down the service\n");
+    fflush(stdout);
     close_pool();
     MHD_stop_daemon(main_daemon);
     exit(0);
@@ -572,17 +581,18 @@ int main() {
   char *connection_string = getenv("CONNECTION_STRING");
 
   if (signal(SIGINT, sighandler) == SIG_ERR) {
-    printf("Failed to set the signal handler\n");
+    fprintf(stderr, "Failed to set the signal handler\n");
     return 1;
   }
 
   if (signal(SIGTERM, sighandler) == SIG_ERR) {
-    printf("Failed to set the signal handler\n");
+    fprintf(stderr, "Failed to set the signal handler\n");
     return 1;
   }
 
-  create_pool(connection_string);
-  // free(connection_string);
+  if (create_pool(connection_string)) {
+    return 1;
+  }
 
   main_daemon = MHD_start_daemon(
       MHD_USE_EPOLL_INTERNAL_THREAD | MHD_USE_EPOLL_TURBO,
@@ -595,13 +605,14 @@ int main() {
       MHD_OPTION_END);
 
   if (!main_daemon) {
-    printf("Failed to start the server\n");
+    fprintf(stderr, "Failed to start the server\n");
     return 1;
   } else {
     printf("Threads: %d\n", threads);
   }
 
   printf("Server running on port %d.\n", port);
+  fflush(stdout);
 
   while (1);
 }
