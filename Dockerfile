@@ -1,12 +1,3 @@
-# A Dockerfile for the file main.c using clang
-# Usage: docker build -t clang .
-#        docker run -it --rm clang
-#        docker run -it --rm -v $(pwd):/mnt clang
-#        docker run -it --rm -v $(pwd):/mnt clang /mnt/main.c
-#        docker run -it --rm -v $(pwd):/mnt clang /mnt/main.c -o /mnt/main
-#        docker run -it --rm -v $(pwd):/mnt clang /mnt/main.c -o /mnt/main -lm
-#        docker run -it --rm -v $(pwd):/mnt clang /mnt/main.c -o /mnt/main -lm -fsanitize=address
-
 ARG BUILDER_IMAGE="ubuntu:22.04"
 
 FROM ${BUILDER_IMAGE} as builder
