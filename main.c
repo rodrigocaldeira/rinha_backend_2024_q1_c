@@ -675,6 +675,6 @@ int main() {
   printf("Server running on port %d.\n", port);
   fflush(stdout);
 
-  while (1);
+  pause();
 }
 
